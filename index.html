@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF 數位印章工具 - 終極完整版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <style>
+        body { background-color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+        .canvas-container { position: relative; box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1); margin-bottom: 2rem; cursor: crosshair; background-color: white; display: inline-block; line-height: 0; user-select: none; }
+        #pdf-canvas { display: block; max-width: 100%; height: auto; }
+        .stamp-overlay { position: absolute; border: 2px dashed #3b82f6; cursor: move; z-index: 10; line-height: normal; background-color: rgba(59, 130, 246, 0.05); }
+        .stamp-overlay img { width: 100%; height: 100%; pointer-events: none; display: block; }
+        .resize-handle { position: absolute; width: 24px; height: 24px; background: #3b82f6; right: -12px; bottom: -12px; cursor: nwse-resize; border-radius: 50%; border: 3px solid white; box-shadow: 0 4px 6px rgba(0,0,0,0.2); }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
+
+    <!-- Firebase 雲端資料庫 SDK (用於瀏覽人數與留言) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, updateDoc, increment, collection, addDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // 檢查是否在 AI 測試環境中
+            if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                const firebaseConfig = JSON.parse(__firebase_config);
+                const app = initializeApp(firebaseConfig);
+                const auth = getAuth(app);
+                const db = getFirestore(app);
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                let currentUser = null;
+
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) { console.error("Auth Error:", error); }
+                };
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        currentUser = user;
+                        startAnalytics();
+                        loadComments();
+                    } else {
+                        initAuth();
+                    }
+                });
+
+                async function startAnalytics() {
+                    if (!currentUser) return;
+                    const statsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'analytics', 'stats');
+                    try {
+                        const snap = await getDoc(statsDocRef);
+                        if (!snap.exists()) await setDoc(statsDocRef, { views: 1 });
+                        else await updateDoc(statsDocRef, { views: increment(1) });
+                        
+                        onSnapshot(statsDocRef, (docSnap) => {
+                            const data = docSnap.data();
+                            const vc = document.getElementById('view-count');
+                            if (data && vc) vc.innerText = data.views || 0;
+                        });
+                    } catch (e) { console.error("Analytics Error:", e); }
+                }
+
+                function loadComments() {
+                    if (!currentUser) return;
+                    const commentsCol = collection(db, 'artifacts', appId, 'public', 'data', 'comments');
+                    onSnapshot(commentsCol, (snapshot) => {
+                        const commentList = document.getElementById('comment-list');
+                        if (!commentList) return;
+                        const comments = [];
+                        snapshot.forEach(doc => comments.push({ id: doc.id, ...doc.data() }));
+                        comments.sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0));
+                        commentList.innerHTML = comments.map(c => `
+                            <div class="p-4 bg-slate-50 rounded-2xl mb-3 border border-slate-100 shadow-sm">
+                                <div class="flex justify-between text-[11px] text-slate-400 mb-2 font-mono">
+                                    <span class="font-bold text-blue-500 bg-blue-50 px-2 py-0.5 rounded-md">ID: ${c.userId?.substring(0, 6)}</span>
+                                    <span>${c.timestamp ? new Date(c.timestamp.seconds * 1000).toLocaleString() : '傳送中...'}</span>
+                                </div>
+                                <p class="text-sm text-slate-700 leading-relaxed">${escapeHtml(c.text)}</p>
+                            </div>
+                        `).join('') || '<p class="text-slate-400 text-sm text-center py-8">目前尚無留言，來搶頭香吧！</p>';
+                    });
+                }
+
+                window.sendComment = async () => {
+                    const input = document.getElementById('comment-input');
+                    const text = input?.value.trim();
+                    if (!text || !currentUser) return;
+                    try {
+                        const commentsCol = collection(db, 'artifacts', appId, 'public', 'data', 'comments');
+                        await addDoc(commentsCol, { text: text, userId: currentUser.uid, timestamp: serverTimestamp() });
+                        input.value = '';
+                    } catch (e) { console.error("Add Comment Error:", e); }
+                };
+
+                function escapeHtml(text) {
+                    const div = document.createElement('div');
+                    div.textContent = text;
+                    return div.innerHTML;
+                }
+            } else {
+                // 若部署至 GitHub，則顯示離線狀態
+                const commentList = document.getElementById('comment-list');
+                if(commentList) commentList.innerHTML = `
+                    <div class="flex flex-col items-center justify-center h-full text-slate-400 space-y-3">
+                        <svg class="w-12 h-12 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                        <p class="text-sm font-bold">雲端資料庫已斷開</p>
+                        <p class="text-xs text-center px-4">您目前處於自己的 GitHub 環境。<br>若要啟用留言板與瀏覽人數，需另外綁定您個人的 Firebase 資料庫。</p>
+                    </div>`;
+                const vc = document.getElementById('view-count');
+                if(vc) vc.innerText = "離線";
+            }
+        });
+    </script>
+</head>
+<body class="flex flex-col min-h-screen">
+    <!-- 頂部導航 -->
+    <nav class="bg-white border-b border-slate-200 px-6 py-4 flex justify-between items-center sticky top-0 z-50">
+        <div class="flex items-center gap-3">
+            <div class="bg-blue-600 p-2 rounded-xl shadow-sm">
+                <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+            </div>
+            <h1 class="text-2xl font-black text-slate-800 tracking-tight">PDF 數位印章工具 <span class="text-sm font-bold text-emerald-500 ml-2 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-100">矩陣對位 100% 精準版</span></h1>
+        </div>
+        <div class="flex items-center gap-6">
+            <div class="flex items-center gap-2 text-slate-500 text-sm font-medium bg-slate-50 px-4 py-2 rounded-lg border border-slate-200">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                <span>瀏覽人數: <span id="view-count" class="text-blue-600 font-black">載入中...</span></span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="max-w-[1600px] mx-auto py-8 px-4 w-full flex-grow flex flex-col gap-8">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            <!-- 左側：控制面板 -->
+            <div class="lg:col-span-3 space-y-6">
+                <!-- 第一步 -->
+                <div class="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                    <h2 class="text-sm font-black text-slate-400 uppercase tracking-widest mb-5 flex items-center gap-2">
+                        <span class="bg-blue-100 text-blue-700 w-6 h-6 rounded-full flex items-center justify-center">1</span> 準備印章
+                    </h2>
+                    <input type="file" id="stamp-upload" accept="image/*" class="hidden">
+                    <label for="stamp-upload" class="block w-full text-center py-6 px-4 border-2 border-dashed border-blue-200 bg-blue-50/50 rounded-2xl cursor-pointer hover:border-blue-500 hover:bg-blue-50 transition-all text-blue-600 font-bold">
+                        上傳印章照片
+                    </label>
+                    <div id="stamp-preview-container" class="mt-5 hidden">
+                        <div class="bg-slate-100 rounded-xl p-4 flex justify-center bg-[url('https://www.transparenttextures.com/patterns/checkerboard.png')] overflow-hidden border border-slate-200">
+                            <canvas id="stamp-canvas" class="max-w-full h-auto rounded shadow-sm"></canvas>
+                        </div>
+                        <div class="mt-5 space-y-2">
+                            <div class="flex justify-between text-xs font-bold text-slate-500">
+                                <label>去背容差 (往右拉去除更多背景)</label>
+                                <span id="tolerance-val" class="text-blue-600">80</span>
+                            </div>
+                            <input type="range" id="tolerance" min="0" max="220" value="80" class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 第二步 -->
+                <div class="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                    <h2 class="text-sm font-black text-slate-400 uppercase tracking-widest mb-5 flex items-center gap-2">
+                        <span class="bg-blue-100 text-blue-700 w-6 h-6 rounded-full flex items-center justify-center">2</span> 選擇 PDF
+                    </h2>
+                    <input type="file" id="pdf-upload" accept="application/pdf" class="hidden">
+                    <label for="pdf-upload" class="block w-full text-center py-6 px-4 border-2 border-dashed border-slate-200 rounded-2xl cursor-pointer hover:border-slate-400 hover:bg-slate-50 transition-all text-slate-600 font-bold">
+                        上傳發票或工程單
+                    </label>
+                </div>
+
+                <!-- 下載按鈕 -->
+                <button id="download-btn" disabled class="w-full py-5 bg-slate-900 text-white font-black text-lg rounded-2xl shadow-xl hover:bg-blue-600 hover:shadow-blue-500/30 hover:-translate-y-1 disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none disabled:transform-none disabled:cursor-not-allowed transition-all flex items-center justify-center gap-3">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                    儲存並下載 PDF
+                </button>
+            </div>
+
+            <!-- 右側：編輯預覽區 -->
+            <div class="lg:col-span-9">
+                <div class="bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden flex flex-col min-h-[850px] h-full">
+                    <div class="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50/80">
+                        <div class="flex items-center gap-3">
+                            <span class="w-3 h-3 bg-emerald-400 rounded-full animate-pulse shadow-[0_0_10px_rgba(52,211,153,0.8)]"></span>
+                            <span class="text-xs font-black text-slate-400 tracking-widest uppercase">編輯工作區</span>
+                        </div>
+                        <div id="page-controls" class="hidden flex items-center bg-white border border-slate-200 rounded-full px-2 py-1 shadow-sm">
+                            <button id="prev-page" class="p-2 hover:text-blue-600 disabled:opacity-20 transition-colors"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg></button>
+                            <span id="page-num" class="px-5 text-sm font-black text-slate-800">1 / 1</span>
+                            <button id="next-page" class="p-2 hover:text-blue-600 disabled:opacity-20 transition-colors"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg></button>
+                        </div>
+                        <button id="clear-all-stamps" class="text-xs font-bold text-slate-400 hover:text-red-500 hover:bg-red-50 px-3 py-1.5 rounded-lg transition-colors uppercase">清除本頁</button>
+                    </div>
+                    
+                    <div id="viewer-container" class="flex-grow overflow-auto bg-slate-100/50 flex justify-center items-start p-10 custom-scrollbar">
+                        <div id="canvas-wrapper" class="canvas-container hidden">
+                            <canvas id="pdf-canvas"></canvas>
+                        </div>
+                        <div id="empty-state" class="flex flex-col items-center justify-center text-slate-300 py-60 w-full">
+                            <svg class="w-32 h-32 mb-8 opacity-20" fill="currentColor" viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                            <p class="text-xl font-black tracking-widest uppercase">請先上傳 PDF 檔案開始編輯</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 下半部：留言板 -->
+        <div class="bg-white rounded-3xl border border-slate-200 shadow-sm flex flex-col h-[400px] mt-4">
+            <div class="p-5 border-b border-slate-100 font-bold text-slate-700 flex items-center gap-2 text-base bg-slate-50/50 rounded-t-3xl">
+                <svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
+                社群討論留言板
+            </div>
+            <div id="comment-list" class="flex-grow overflow-auto p-6 custom-scrollbar text-sm space-y-4">
+                <!-- 留言內容 -->
+            </div>
+            <div class="p-4 border-t border-slate-100 flex gap-3 bg-white rounded-b-3xl">
+                <input type="text" id="comment-input" placeholder="在這裡輸入您的留言或建議..." class="flex-grow bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none transition-all shadow-inner">
+                <button onclick="window.sendComment && window.sendComment()" class="bg-blue-600 text-white px-6 py-3 rounded-xl hover:bg-blue-700 font-bold shadow-md transition-colors flex items-center gap-2">
+                    <span>送出</span>
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { PDFDocument, degrees } = PDFLib;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        // 元件綁定
+        const stampUpload = document.getElementById('stamp-upload');
+        const stampCanvas = document.getElementById('stamp-canvas');
+        const stampCtx = stampCanvas.getContext('2d');
+        const toleranceInput = document.getElementById('tolerance');
+        const toleranceVal = document.getElementById('tolerance-val');
+        const pdfUpload = document.getElementById('pdf-upload');
+        const pdfCanvas = document.getElementById('pdf-canvas');
+        const canvasWrapper = document.getElementById('canvas-wrapper');
+        const emptyState = document.getElementById('empty-state');
+        const downloadBtn = document.getElementById('download-btn');
+
+        // 狀態變數
+        let originalStampImg = null;
+        let processedStampDataUrl = null;
+        let stampAspectRatio = 1;
+        let pdfDoc = null;
+        let currentPage = 1;
+        let pdfRawBuffer = null;
+        let stampsOnPages = {}; 
+        let pageViewports = {};
+
+        // 清除畫面上的印章
+        function clearStampOverlays() {
+            const wrappers = canvasWrapper.querySelectorAll('.stamp-overlay');
+            wrappers.forEach(o => o.remove());
+        }
+
+        // --- 1. 印章處理邏輯 ---
+        stampUpload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                originalStampImg = new Image();
+                originalStampImg.onload = () => {
+                    stampAspectRatio = originalStampImg.width / originalStampImg.height;
+                    document.getElementById('stamp-preview-container').classList.remove('hidden');
+                    processStamp();
+                };
+                originalStampImg.src = ev.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        toleranceInput.addEventListener('input', () => {
+            toleranceVal.innerText = toleranceInput.value;
+            processStamp();
+        });
+
+        function processStamp() {
+            if (!originalStampImg) return;
+            const maxDim = 400;
+            let tw = originalStampImg.width, th = originalStampImg.height;
+            if (tw > maxDim || th > maxDim) {
+                const r = Math.min(maxDim / tw, maxDim / th);
+                tw *= r; th *= r;
+            }
+            stampCanvas.width = tw; stampCanvas.height = th;
+            stampCtx.drawImage(originalStampImg, 0, 0, tw, th);
+            
+            // 去背演算法
+            const imgData = stampCtx.getImageData(0, 0, tw, th);
+            const data = imgData.data;
+            const tol = parseInt(toleranceInput.value);
+            for (let i = 0; i < data.length; i += 4) {
+                const brightness = (data[i] + data[i+1] + data[i+2]) / 3;
+                if (brightness > (255 - tol)) {
+                    data[i+3] = 0; // 設為透明
+                }
+            }
+            stampCtx.putImageData(imgData, 0, 0);
+            processedStampDataUrl = stampCanvas.toDataURL('image/png');
+            
+            if (pdfDoc) downloadBtn.disabled = false;
+        }
+
+        // --- 2. PDF 載入與渲染 ---
+        pdfUpload.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async (ev) => {
+                pdfRawBuffer = ev.target.result;
+                const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(pdfRawBuffer.slice(0)) });
+                pdfDoc = await loadingTask.promise;
+                currentPage = 1;
+                stampsOnPages = {}; 
+                pageViewports = {};
+                renderPage(currentPage);
+                document.getElementById('page-controls').classList.remove('hidden');
+                if (processedStampDataUrl) downloadBtn.disabled = false;
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        async function renderPage(num) {
+            if (!pdfDoc) return;
+            const page = await pdfDoc.getPage(num);
+            // 設定較高的解析度以便清晰預覽
+            const viewport = page.getViewport({ scale: 1.5 });
+            pageViewports[num] = viewport;
+            
+            pdfCanvas.width = viewport.width;
+            pdfCanvas.height = viewport.height;
+            emptyState.classList.add('hidden');
+            canvasWrapper.classList.remove('hidden');
+            
+            await page.render({ canvasContext: pdfCanvas.getContext('2d'), viewport }).promise;
+            
+            document.getElementById('page-num').innerText = `${num} / ${pdfDoc.numPages}`;
+            clearStampOverlays();
+            if (stampsOnPages[num]) {
+                stampsOnPages[num].forEach((s, idx) => createStampOverlay(s, idx));
+            }
+        }
+
+        // --- 3. 蓋章互動操作 ---
+        canvasWrapper.addEventListener('click', (e) => {
+            if (e.target !== pdfCanvas || !processedStampDataUrl) return;
+            
+            // 精準獲取點擊在 Canvas 上的位置
+            const rect = pdfCanvas.getBoundingClientRect();
+            const clickVisualX = e.clientX - rect.left;
+            const clickVisualY = e.clientY - rect.top;
+            
+            // 設定印章在螢幕上的預設像素大小
+            const baseVisualW = 120;
+            const baseVisualH = baseVisualW / stampAspectRatio;
+            
+            // 儲存為百分比，這樣視窗縮放也不會跑位
+            const newRelStamp = {
+                relX: (clickVisualX - baseVisualW/2) / rect.width,
+                relY: (clickVisualY - baseVisualH/2) / rect.height,
+                relW: baseVisualW / rect.width,
+                relH: baseVisualH / rect.height,
+                dataUrl: processedStampDataUrl,
+                aspectRatio: stampAspectRatio
+            };
+            
+            if (!stampsOnPages[currentPage]) stampsOnPages[currentPage] = [];
+            stampsOnPages[currentPage].push(newRelStamp);
+            renderPage(currentPage);
+        });
+
+        function createStampOverlay(stampObj, index) {
+            const rect = pdfCanvas.getBoundingClientRect();
+            const div = document.createElement('div');
+            div.className = 'stamp-overlay shadow-lg';
+            
+            // 更新畫面上印章的大小與位置
+            const updateVisuals = () => {
+                div.style.left = (stampObj.relX * rect.width) + 'px';
+                div.style.top = (stampObj.relY * rect.height) + 'px';
+                div.style.width = (stampObj.relW * rect.width) + 'px';
+                div.style.height = (stampObj.relH * rect.height) + 'px';
+            };
+            updateVisuals();
+            
+            const img = document.createElement('img');
+            img.src = stampObj.dataUrl;
+            div.appendChild(img);
+            
+            const handle = document.createElement('div');
+            handle.className = 'resize-handle';
+            div.appendChild(handle);
+            
+            const delBtn = document.createElement('button');
+            delBtn.innerHTML = '✕';
+            delBtn.className = 'absolute -top-4 -right-4 bg-red-500 text-white rounded-full w-8 h-8 flex items-center justify-center text-[10px] font-black hover:scale-110 transition-transform shadow-md';
+            delBtn.onclick = (e) => {
+                e.stopPropagation();
+                stampsOnPages[currentPage].splice(index, 1);
+                renderPage(currentPage);
+            };
+            div.appendChild(delBtn);
+            
+            let isDragging = false, isResizing = false;
+            let sx, sy, ix, iy, iw;
+            
+            div.onmousedown = (e) => {
+                e.preventDefault(); e.stopPropagation();
+                if (e.target === handle) isResizing = true;
+                else isDragging = true;
+                
+                sx = e.clientX; sy = e.clientY;
+                ix = stampObj.relX * rect.width; 
+                iy = stampObj.relY * rect.height; 
+                iw = stampObj.relW * rect.width;
+                
+                const onMove = (me) => {
+                    const dx = me.clientX - sx; const dy = me.clientY - sy;
+                    if (isDragging) {
+                        stampObj.relX = (ix + dx) / rect.width;
+                        stampObj.relY = (iy + dy) / rect.height;
+                    } else if (isResizing) {
+                        // 鎖定比例調整大小
+                        const newW = Math.max(40, iw + dx);
+                        const newH = newW / stampObj.aspectRatio;
+                        stampObj.relW = newW / rect.width;
+                        stampObj.relH = newH / rect.height;
+                    }
+                    updateVisuals();
+                };
+                const onUp = () => {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            };
+            canvasWrapper.appendChild(div);
+        }
+
+        // --- 4. 匯出 PDF (最核心的 100% 精準對位演算法) ---
+        downloadBtn.onclick = async () => {
+            try {
+                downloadBtn.innerHTML = '<svg class="animate-spin w-6 h-6 mr-2" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> 匯出中...';
+                downloadBtn.disabled = true;
+                
+                const pdfLibDoc = await PDFDocument.load(pdfRawBuffer.slice(0));
+                
+                for (const pNumStr in stampsOnPages) {
+                    const pNum = parseInt(pNumStr);
+                    const stamps = stampsOnPages[pNumStr];
+                    if (!stamps || stamps.length === 0) continue;
+                    
+                    const page = pdfLibDoc.getPage(pNum - 1);
+                    const viewport = pageViewports[pNum]; // 取得該頁面的渲染矩陣
+                    
+                    for (const s of stamps) {
+                        const imgBytes = dataURLtoUint8Array(s.dataUrl);
+                        if (!imgBytes) continue;
+                        const embeddedImg = await pdfLibDoc.embedPng(imgBytes);
+                        
+                        // 【關鍵修復】: 利用 PDF.js 的底層引擎進行座標逆向轉換
+                        // 1. 計算印章在 Canvas 上的「正中心點」像素座標
+                        const internalCenterCanvasX = (s.relX + (s.relW / 2)) * viewport.width;
+                        const internalCenterCanvasY = (s.relY + (s.relH / 2)) * viewport.height;
+                        
+                        // 2. 透過原生矩陣，將這個中心點轉換為 PDF 底層的物理座標
+                        // 這一行完美繞過了所有的 CropBox/MediaBox 偏移問題
+                        const [pdfCenterX, pdfCenterY] = viewport.convertToPdfPoint(internalCenterCanvasX, internalCenterCanvasY);
+                        
+                        // 3. 計算印章在 PDF 中的物理長寬 (點數)
+                        const pdfW = (s.relW * viewport.width) / viewport.scale;
+                        const pdfH = (s.relH * viewport.height) / viewport.scale;
+                        
+                        // 4. 根據頁面本身的旋轉角度，反推繪製的起點，確保印章是正的
+                        const rotation = page.getRotation().angle;
+                        const theta = -rotation * Math.PI / 180;
+                        
+                        const drawX = pdfCenterX - (pdfW / 2) * Math.cos(theta) + (pdfH / 2) * Math.sin(theta);
+                        const drawY = pdfCenterY - (pdfW / 2) * Math.sin(theta) - (pdfH / 2) * Math.cos(theta);
+                        
+                        // 5. 蓋章！
+                        page.drawImage(embeddedImg, { 
+                            x: drawX, 
+                            y: drawY, 
+                            width: pdfW, 
+                            height: pdfH, 
+                            rotate: degrees(-rotation) 
+                        });
+                    }
+                }
+                
+                const pdfBytes = await pdfLibDoc.save();
+                const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = `蓋章發票_${new Date().getTime()}.pdf`;
+                link.click();
+                
+                downloadBtn.innerHTML = '<svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg> 儲存並下載 PDF';
+                downloadBtn.disabled = false;
+            } catch (err) {
+                console.error(err);
+                alert("下載失敗，請重新整理頁面再試一次。");
+                downloadBtn.innerHTML = '<svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg> 儲存並下載 PDF';
+                downloadBtn.disabled = false;
+            }
+        };
+
+        // 輔助函數：Base64 轉二進制
+        function dataURLtoUint8Array(dataurl) {
+            const arr = dataurl.split(',');
+            const bstr = atob(arr[1]);
+            let n = bstr.length;
+            const u8arr = new Uint8Array(n);
+            while(n--) u8arr[n] = bstr.charCodeAt(n);
+            return u8arr;
+        }
+
+        // 頁面控制按鈕
+        document.getElementById('prev-page').onclick = () => { if (currentPage > 1) renderPage(--currentPage); };
+        document.getElementById('next-page').onclick = () => { if (currentPage < pdfDoc.numPages) renderPage(++currentPage); };
+        document.getElementById('clear-all-stamps').onclick = () => { stampsOnPages[currentPage] = []; renderPage(currentPage); };
+        
+        // 視窗縮放時自動重繪，保持印章對齊
+        window.addEventListener('resize', () => { if(pdfDoc) renderPage(currentPage); });
+    </script>
+</body>
+</html>
